@@ -1,0 +1,11 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.env
+.env.*
+service-account.json
+*.key.json
+.DS_Store
+.vscode/

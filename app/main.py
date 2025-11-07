@@ -1,3 +1,5 @@
+# main.py (only the changes shown)
+
 import os
 import csv
 import io
@@ -9,8 +11,9 @@ from .gdrive import (
     download_file_by_name_from_folder,
     upload_bytes_to_folder_as_file,
 )
-from .parser import parse_param_values_and_pages           # <-- use new parser
-from .comparer import compare_param_maps_to_csv            # <-- new headers
+from datetime import datetime
+from .parser import parse_param_values_and_pages
+from .comparer import HEADERS, compare_param_maps_rows   # <-- import HEADERS & rows helper
 
 app = FastAPI(
     title="Prompt QA Tool",
@@ -22,20 +25,18 @@ app = FastAPI(
 
 @app.post("/run", response_model=RunJobResult)
 async def run_job(
-    qa_guides_folder: str = Form(..., description="Shared Google Drive FOLDER LINK containing QA Guide .txt files"),
-    llm_outputs_folder: str = Form(..., description="Shared Google Drive FOLDER LINK containing LLM Output .txt files"),
-    output_folder: str = Form(..., description="Shared Google Drive FOLDER LINK to upload the result CSVs"),
-    mapping_csv_file: UploadFile = File(..., description="CSV upload with headers qa_name,llm_name (or first two columns)"),
+    qa_guides_folder: str = Form(...),
+    llm_outputs_folder: str = Form(...),
+    output_folder: str = Form(...),
+    mapping_csv_file: UploadFile = File(...),
 ):
     try:
         drive = get_drive()
 
-        # Convert links -> IDs
         qa_guides_folder_id = extract_folder_id(qa_guides_folder)
         llm_outputs_folder_id = extract_folder_id(llm_outputs_folder)
         output_folder_id = extract_folder_id(output_folder)
 
-        # Read uploaded mapping CSV
         data = await mapping_csv_file.read()
         try:
             text = data.decode("utf-8-sig")
@@ -76,45 +77,49 @@ async def run_job(
         if not mapping_rows:
             raise HTTPException(status_code=400, detail="Mapping CSV is empty or has no usable rows")
 
-        outputs: list[OutputRow] = []
+        # ---- NEW: one combined CSV buffer ----
+        combined = io.StringIO()
+        writer = csv.writer(combined)
+        writer.writerow(HEADERS)
+
+        # Build all rows across all pairs
         for idx, row in enumerate(mapping_rows, start=1):
             qa_name = (row.get("qa_name") or "").strip()
             llm_name = (row.get("llm_name") or "").strip()
             if not qa_name or not llm_name:
                 raise HTTPException(status_code=400, detail=f"Row {idx} missing qa_name/llm_name")
 
-            # Download the two text files for this row
             qa_text = download_file_by_name_from_folder(drive, qa_guides_folder_id, qa_name)
             llm_text = download_file_by_name_from_folder(drive, llm_outputs_folder_id, llm_name)
 
-            # Parse values + page numbers
             qa_vals, qa_pages = parse_param_values_and_pages(qa_text)
             llm_vals, llm_pages = parse_param_values_and_pages(llm_text)
 
-            # Build CSV with the NEW headers and page/filename fields
-            csv_bytes, csv_filename = compare_param_maps_to_csv(
+            for out_row in compare_param_maps_rows(
                 qa_vals,
                 llm_vals,
-                output_basename=os.path.splitext(os.path.basename(qa_name))[0],
                 qa_pages=qa_pages,
                 llm_pages=llm_pages,
                 qa_filename=os.path.basename(qa_name),
                 llm_filename=os.path.basename(llm_name),
-            )
+            ):
+                writer.writerow(out_row)
 
-            # Upload result
-            uploaded = upload_bytes_to_folder_as_file(
-                drive,
-                parent_folder_id=output_folder_id,
-                filename=csv_filename,
-                mime_type="text/csv",
-                data=csv_bytes,
-            )
-            outputs.append(OutputRow(row=idx, csv_file_id=uploaded["id"], csv_file_name=uploaded["name"]))
+        # Encode and upload ONE file (no filenames embedded)
+        csv_bytes = combined.getvalue().encode("utf-8")
+        csv_filename = f"prompt_qa_tool_output_{datetime.utcnow():%Y%m%d_%H%M%S}.csv"
 
+        uploaded = upload_bytes_to_folder_as_file(
+            drive,
+            parent_folder_id=output_folder_id,
+            filename=csv_filename,
+            mime_type="text/csv",
+            data=csv_bytes,
+        )
+
+        # Return one OutputRow pointing to the single CSV
+        outputs = [OutputRow(row=1, csv_file_id=uploaded["id"], csv_file_name=uploaded["name"])]
         return RunJobResult(outputs=outputs)
 
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
